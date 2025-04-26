@@ -20,7 +20,6 @@ const client = wrapper(axios.create({
   withCredentials: true 
 }));
 
-
 const DEFAULT_HEADERS = {
   'accept': 'application/json, text/plain, */*',
   'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
@@ -34,9 +33,12 @@ const DEFAULT_HEADERS = {
   'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
 };
 
-
 const web3 = new Web3(RPC_URL);
 
+// Maximum number of retry attempts for streak update
+const MAX_RETRY_ATTEMPTS = 3;
+// Delay between retry attempts (in milliseconds)
+const RETRY_DELAY = 2000;
 
 function logToFile(message) {
   const timestamp = new Date().toISOString();
@@ -58,7 +60,6 @@ async function readPrivateKeys() {
     throw error;
   }
 }
-
 
 async function initializeSession() {
   try {
@@ -103,7 +104,6 @@ async function saveCookies() {
     return false;
   }
 }
-
 
 async function loadCookies() {
   try {
@@ -177,7 +177,6 @@ async function signMessage(privateKey, nonceData) {
   }
 }
 
-
 async function verifySignature(signData) {
   try {
     logToFile('Sending verify request...');
@@ -243,30 +242,57 @@ async function getUserProfile() {
   }
 }
 
-async function updateStreak() {
-  try {
-    logToFile('Updating streak...');
-    
-    const response = await client.post(`${AUTH_API_URL}/users/streak`, {}, {
-      headers: DEFAULT_HEADERS,
-      referrer: BASE_URL,
-      referrerPolicy: 'strict-origin-when-cross-origin'
-    });
-    
-    const data = response.data;
-    logToFile(`Streak Update - Current Streak: ${data.streak}, Longest Streak: ${data.longestStreak}`);
-    
-    return data;
-  } catch (error) {
-    logToFile(`Error updating streak: ${error.message}`);
-    if (error.response) {
-      logToFile(`Response status: ${error.response.status}`);
-      logToFile(`Response data: ${JSON.stringify(error.response.data)}`);
-    }
-    return null;
-  }
-}
+async function updateStreakWithRetry() {
+  let attempts = 0;
+  let streakData = null;
 
+  while (attempts < MAX_RETRY_ATTEMPTS) {
+    try {
+      logToFile(`Updating streak (attempt ${attempts + 1})...`);
+      
+      const response = await client.post(`${AUTH_API_URL}/users/streak`, {}, {
+        headers: DEFAULT_HEADERS,
+        referrer: BASE_URL,
+        referrerPolicy: 'strict-origin-when-cross-origin'
+      });
+      
+      const data = response.data;
+      
+      // Check if we have valid streak data
+      if (data && data.streak !== undefined && data.longestStreak !== undefined && data.lastVisitDate) {
+        logToFile(`Streak Update - Current Streak: ${data.streak}, Longest Streak: ${data.longestStreak}, Last Visit: ${data.lastVisitDate}`);
+        streakData = data;
+        break;
+      } else {
+        logToFile(`Invalid streak data returned: ${JSON.stringify(data)}`);
+        attempts++;
+        
+        if (attempts < MAX_RETRY_ATTEMPTS) {
+          logToFile(`Retrying in ${RETRY_DELAY/1000} seconds...`);
+          await delay(RETRY_DELAY);
+        }
+      }
+    } catch (error) {
+      logToFile(`Error updating streak (attempt ${attempts + 1}): ${error.message}`);
+      if (error.response) {
+        logToFile(`Response status: ${error.response.status}`);
+        logToFile(`Response data: ${JSON.stringify(error.response.data)}`);
+      }
+      
+      attempts++;
+      if (attempts < MAX_RETRY_ATTEMPTS) {
+        logToFile(`Retrying in ${RETRY_DELAY/1000} seconds...`);
+        await delay(RETRY_DELAY);
+      }
+    }
+  }
+
+  if (!streakData) {
+    logToFile(`Failed to update streak after ${MAX_RETRY_ATTEMPTS} attempts`);
+  }
+  
+  return streakData;
+}
 
 async function getUserExperience() {
   try {
@@ -291,44 +317,186 @@ async function getUserExperience() {
   }
 }
 
+// New function to get available social tasks
+async function getSocialTasks() {
+  try {
+    logToFile('Getting social tasks...');
+    
+    const response = await client.get(`${AUTH_API_URL}/users/social/tasks`, {
+      headers: DEFAULT_HEADERS,
+      referrer: BASE_URL,
+      referrerPolicy: 'strict-origin-when-cross-origin'
+    });
+    
+    const tasks = response.data;
+    logToFile(`Retrieved ${tasks.length} social tasks`);
+    
+    // Count completed and pending tasks
+    const completedTasks = tasks.filter(task => task.completed).length;
+    const pendingTasks = tasks.length - completedTasks;
+    
+    logToFile(`Tasks summary: ${completedTasks} completed, ${pendingTasks} pending`);
+    
+    return tasks;
+  } catch (error) {
+    logToFile(`Error getting social tasks: ${error.message}`);
+    if (error.response) {
+      logToFile(`Response status: ${error.response.status}`);
+      logToFile(`Response data: ${JSON.stringify(error.response.data)}`);
+    }
+    return [];
+  }
+}
+
+// New function to verify a specific task
+async function verifyTask(taskId) {
+  try {
+    logToFile(`Verifying task ID: ${taskId}...`);
+    
+    const response = await client.get(`${AUTH_API_URL}/users/social/tasks/${taskId}/verify`, {
+      headers: DEFAULT_HEADERS,
+      referrer: BASE_URL,
+      referrerPolicy: 'strict-origin-when-cross-origin'
+    });
+    
+    const result = response.data;
+    logToFile(`Task ${taskId} verification result: ${JSON.stringify(result)}`);
+    
+    return result.success === true;
+  } catch (error) {
+    logToFile(`Error verifying task ${taskId}: ${error.message}`);
+    if (error.response) {
+      logToFile(`Response status: ${error.response.status}`);
+      logToFile(`Response data: ${JSON.stringify(error.response.data)}`);
+    }
+    return false;
+  }
+}
+
+// New function to process all social tasks
+async function processSocialTasks() {
+  try {
+    logToFile('\n----- Processing Social Tasks -----');
+    
+    // Get all available tasks
+    const tasks = await getSocialTasks();
+    if (!tasks || tasks.length === 0) {
+      logToFile('No tasks found or error getting tasks');
+      return { success: false, completed: 0, total: 0 };
+    }
+    
+    // Filter out pending tasks
+    const pendingTasks = tasks.filter(task => !task.completed);
+    logToFile(`Found ${pendingTasks.length} pending tasks to process`);
+    
+    if (pendingTasks.length === 0) {
+      logToFile('No pending tasks to complete');
+      return { success: true, completed: 0, total: tasks.length, alreadyCompleted: tasks.length };
+    }
+    
+    let completedCount = 0;
+    
+    // Process each pending task
+    for (const task of pendingTasks) {
+      logToFile(`Processing task: ${task.id} - ${task.name} (${task.platform})`);
+      logToFile(`Task description: ${task.description}`);
+      
+      // Add random delay between tasks
+      const taskDelay = 1000 + Math.random() * 2000;
+      await delay(taskDelay);
+      
+      const verified = await verifyTask(task.id);
+      
+      if (verified) {
+        logToFile(`? Successfully completed task: ${task.name}`);
+        completedCount++;
+      } else {
+        logToFile(`? Failed to complete task: ${task.name}`);
+      }
+      
+      // Add another random delay after verification
+      const afterVerifyDelay = 1000 + Math.random() * 1000;
+      await delay(afterVerifyDelay);
+    }
+    
+    logToFile(`Task processing complete. ${completedCount}/${pendingTasks.length} tasks completed successfully`);
+    
+    return {
+      success: true,
+      completed: completedCount,
+      total: tasks.length,
+      alreadyCompleted: tasks.length - pendingTasks.length
+    };
+  } catch (error) {
+    logToFile(`Error processing social tasks: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function processAccount(privateKey, index) {
   try {
     logToFile(`\n[${index + 1}] Processing account with private key: ${privateKey.substring(0, 6)}...${privateKey.substring(privateKey.length - 4)}`);
 
+    // Delay before processing account
+    await delay(3000);
+
     const account = web3.eth.accounts.privateKeyToAccount(privateKey);
     logToFile(`Wallet address: ${account.address}`);
-    
+
+    // Delay before getting nonce
+    await delay(3000);
     const nonceData = await getNonce(account.address);
+
     logToFile('Signing message...');
+    // Delay before signing message
+    await delay(3000);
     const signData = await signMessage(privateKey, nonceData);
     logToFile('Message signed successfully');
-    logToFile('Verifying signature...');
 
+    logToFile('Verifying signature...');
+    // Delay before verifying signature
+    await delay(3000);
     const authResult = await verifySignature(signData);
     logToFile(`Authentication result: ${JSON.stringify(authResult)}`);
-    
+
     if (authResult.error) {
       logToFile(`Authentication failed for account ${index + 1}`);
       return { success: false, address: account.address };
     }
 
+    // Delay before getting profile data
+    await delay(3000);
     const profileData = await getUserProfile();
-    const streakData = await updateStreak();
+
+    // Update streak with retry logic
+    await delay(3000);
+    const streakData = await updateStreakWithRetry();
+
+    // Process social tasks
+    await delay(3000);
+    const tasksResult = await processSocialTasks();
+
+    // Get user experience after completing tasks
+    await delay(3000);
     const expData = await getUserExperience();
-    
-    return { 
-      success: true, 
+
+    return {
+      success: true,
       address: account.address,
       profile: profileData,
       streak: streakData,
-      exp: expData
+      exp: expData,
+      tasks: tasksResult
     };
   } catch (error) {
     logToFile(`Processing failed for account ${index + 1}: ${error.message}`);
     return { success: false, error: error.message };
   }
 }
-
 
 async function processAllAccounts() {
   try {
@@ -358,13 +526,23 @@ async function processAllAccounts() {
     logToFile(`Successful authentications: ${results.filter(r => r.success).length}`);
     logToFile(`Failed authentications: ${results.filter(r => !r.success).length}`);
     
+    // Summary of tasks completed
+    const tasksSummary = results
+      .filter(r => r.success && r.tasks)
+      .reduce((acc, r) => {
+        if (r.tasks.completed) acc.completed += r.tasks.completed;
+        if (r.tasks.alreadyCompleted) acc.alreadyCompleted += r.tasks.alreadyCompleted;
+        return acc;
+      }, { completed: 0, alreadyCompleted: 0 });
+    
+    logToFile(`Tasks summary - Newly completed: ${tasksSummary.completed}, Previously completed: ${tasksSummary.alreadyCompleted}`);
+    
     return true;
   } catch (error) {
     logToFile(`Error in processing cycle: ${error.message}`);
     return false;
   }
 }
-
 
 async function main() {
   try {
@@ -373,17 +551,16 @@ async function main() {
     while (true) {
       await processAllAccounts();
       
-      const nextRunTime = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      const nextRunTime = new Date(Date.now() + 12 * 60 * 60 * 1000);
       logToFile(`\nCompleted cycle. Next run scheduled at: ${nextRunTime.toLocaleString()}`);
-      logToFile('Waiting 24 hours before next run...');
+      logToFile('Waiting 12 hours before next run...');
       
-      await new Promise(resolve => setTimeout(resolve, 24 * 60 * 60 * 1000));
+      await new Promise(resolve => setTimeout(resolve, 12 * 60 * 60 * 1000));
     }
   } catch (error) {
     logToFile(`Fatal error in main process: ${error.message}`);
     process.exit(1);
   }
 }
-
 
 main();
